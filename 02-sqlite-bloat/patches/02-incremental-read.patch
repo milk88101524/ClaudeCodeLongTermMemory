@@ -1,0 +1,223 @@
+diff --git a/src/main.rs b/src/main.rs
+index 0b3e571..37a1b65 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -19,14 +19,14 @@ use anyhow::{Context, Result, anyhow, bail};
+ use base64::Engine as _;
+ use chrono::{Local, Utc};
+ use clap::{Parser, Subcommand};
+-use rusqlite::{Connection, OpenFlags, params};
++use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+ use serde::Deserialize;
+ use serde_json::Value;
+ use sha2::{Digest, Sha256};
+ use std::collections::HashSet;
+ use std::env;
+ use std::fs;
+-use std::io::{BufRead, BufReader, Read, Write};
++use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+ use std::path::{Path, PathBuf};
+ use std::sync::Mutex;
+ use std::time::SystemTime;
+@@ -941,6 +941,13 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
+             lines     INTEGER
+         );
+     "#)?;
++    // Incremental-ingest resume point (added later; older DBs lack these columns,
++    // NULL = "no offset" → next change does a full read and records one).
++    for col in ["byte_offset INTEGER", "next_seq INTEGER", "tail_hash TEXT"] {
++        if let Err(e) = conn.execute_batch(&format!("ALTER TABLE ingest_state ADD COLUMN {}", col)) {
++            if !e.to_string().contains("duplicate column") { return Err(e.into()); }
++        }
++    }
+     Ok(())
+ }
+ 
+@@ -1073,60 +1080,151 @@ fn flatten_content(rec: &Value) -> (String, Option<String>, String) {
+     }
+ }
+ 
++/// Bytes before the resume offset that are hashed to detect a rewrite of
++/// already-ingested content (Claude Code tombstone removal, truncation, …).
++#[cfg(not(feature = "pg-backend"))]
++const TAIL_HASH_BYTES: u64 = 4096;
++
++#[cfg(not(feature = "pg-backend"))]
++fn read_tail(f: &mut fs::File, end: u64) -> Result<Vec<u8>> {
++    let start = end.saturating_sub(TAIL_HASH_BYTES);
++    let mut buf = vec![0u8; (end - start) as usize];
++    f.seek(SeekFrom::Start(start))?;
++    f.read_exact(&mut buf)?;
++    Ok(buf)
++}
++
++#[cfg(not(feature = "pg-backend"))]
++fn tail_hash(tail: &[u8]) -> String {
++    let tail = &tail[tail.len().saturating_sub(TAIL_HASH_BYTES as usize)..];
++    Sha256::digest(tail).iter().map(|b| format!("{:02x}", b)).collect()
++}
++
++/// One JSONL line → (ts, role, tool_name, content) as stored in msg, or None if the
++/// line is skipped (invalid UTF-8, empty, unparseable, empty content).
++#[cfg(not(feature = "pg-backend"))]
++fn parse_line(buf: &[u8]) -> Option<(String, String, Option<String>, String)> {
++    let raw = std::str::from_utf8(buf).ok()?;
++    if raw.is_empty() { return None; }
++    let rec: Value = serde_json::from_str(raw).ok()?;
++    let ts = rec.get("timestamp").and_then(|v| v.as_str())
++        .or_else(|| rec.get("ts").and_then(|v| v.as_str()))
++        .unwrap_or("")
++        .to_string();
++    let (role, tool_name, content) = flatten_content(&rec);
++    let trimmed = content.trim();
++    if trimmed.is_empty() { return None; }
++    Some((ts, role, tool_name, truncate_chars(trimmed, 200_000)))
++}
++
+ #[cfg(not(feature = "pg-backend"))]
+ fn ingest_file(conn: &Connection, path: &Path) -> Result<usize> {
+     let session_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+     let project = project_slug(path);
++    let path_str = path.to_string_lossy().to_string();
+     let mtime: f64 = fs::metadata(path)?
+         .modified()?
+         .duration_since(SystemTime::UNIX_EPOCH)?
+         .as_secs_f64();
+ 
+-    let prev_mtime: Option<f64> = conn
++    let prev: Option<(f64, Option<i64>, Option<i64>, Option<String>, Option<i64>)> = conn
+         .query_row(
+-            "SELECT mtime FROM ingest_state WHERE file_path = ?1",
+-            params![path.to_string_lossy().as_ref()],
+-            |r| r.get::<_, f64>(0),
++            "SELECT mtime, byte_offset, next_seq, tail_hash, lines FROM ingest_state WHERE file_path = ?1",
++            params![path_str],
++            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+         )
+         .ok();
+-    if let Some(prev) = prev_mtime {
+-        if (prev - mtime).abs() < 1e-6 {
++    if let Some((prev_mtime, ..)) = &prev {
++        if (prev_mtime - mtime).abs() < 1e-6 {
+             return Ok(0);
+         }
+     }
+ 
+-    let f = fs::File::open(path)?;
+-    let reader = BufReader::new(f);
++    let mut f = fs::File::open(path)?;
++    let size = f.metadata()?.len();
++    // Resume after the last complete line only if the bytes before it are unchanged.
++    // `tail` = the consumed bytes the stored hash is computed over (not re-read
++    // afterwards, so a rewrite racing this build is still detected next time).
++    let (mut offset, mut seq, mut valid, mut rewritten, mut tail) = (0u64, 0i64, 0i64, false, Vec::new());
++    if let Some((_, Some(off), Some(ns), Some(h), lines)) = &prev {
++        let off = *off as u64;
++        let t = if size >= off { read_tail(&mut f, off)? } else { Vec::new() };
++        if size >= off && tail_hash(&t) == *h {
++            (offset, seq, valid, tail) = (off, *ns, lines.unwrap_or(0), t);
++        } else {
++            rewritten = true;
++        }
++    }
++    f.seek(SeekFrom::Start(offset))?;
++    let mut reader = BufReader::new(f);
+ 
+     let tx = conn.unchecked_transaction()?;
++    let has_vec: i64 = tx.query_row("SELECT count(*) FROM sqlite_master WHERE name = 'msg_vec'", [], |r| r.get(0))?;
++    // Drop this session's rows from `from_seq` on (FTS via msg_ad; msg_vec has no trigger).
++    let drop_from = |from_seq: i64| -> Result<usize> {
++        if has_vec > 0 {
++            tx.execute("DELETE FROM msg_vec WHERE rowid IN (SELECT rowid FROM msg WHERE session_id = ?1 AND seq >= ?2)",
++                       params![session_id, from_seq])?;
++        }
++        Ok(tx.execute("DELETE FROM msg WHERE session_id = ?1 AND seq >= ?2", params![session_id, from_seq])?)
++    };
++    // Already-ingested bytes changed (tombstone removal / truncation / rewrite): seq may no
++    // longer map to the same line. Re-read from 0, keep the unchanged prefix (rowids and
++    // vectors intact), and re-sync from the first row that differs.
++    let mut check = None;
++    if rewritten {
++        eprintln!("  warning: {} changed before last ingested offset; re-syncing session {}", path.display(), session_id);
++        check = Some(tx.prepare("SELECT ts, role, tool_name, content FROM msg WHERE session_id = ?1 AND seq = ?2")?);
++        // Other files with the same session id (copied project dir) may lose rows too: force their full re-read.
++        tx.execute("DELETE FROM ingest_state WHERE file_path <> ?1 AND substr(file_path, -length(?2)) = ?2",
++                   params![path_str, format!("/{}.jsonl", session_id)])?;
++    }
+     let mut stmt = tx.prepare_cached(
+         "INSERT OR IGNORE INTO msg(session_id,project,seq,ts,role,tool_name,content) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+     )?;
+ 
+     let mut new_rows = 0usize;
+-    for (seq, line) in reader.lines().enumerate() {
+-        let raw = match line { Ok(l) => l, Err(_) => continue };
+-        if raw.is_empty() { continue; }
+-        let rec: Value = match serde_json::from_str(&raw) {
+-            Ok(v) => v,
+-            Err(_) => continue,
+-        };
+-        let ts = rec.get("timestamp").and_then(|v| v.as_str())
+-            .or_else(|| rec.get("ts").and_then(|v| v.as_str()))
+-            .unwrap_or("")
+-            .to_string();
+-        let (role, tool_name, content) = flatten_content(&rec);
+-        let trimmed = content.trim();
+-        if trimmed.is_empty() { continue; }
+-        let bounded = truncate_chars(trimmed, 200_000);
+-        stmt.execute(params![session_id, project, seq as i64, ts, role, tool_name, bounded])?;
+-        new_rows += 1;
++    let mut buf = Vec::new();
++    loop {
++        buf.clear();
++        let n = reader.read_until(b'\n', &mut buf)?;
++        if n == 0 { break; }
++        // A trailing line without '\n' is still parsed (as before) but the resume
++        // point is not advanced past it, so it is re-read once completed.
++        let complete = buf.last() == Some(&b'\n');
++        if complete {
++            tail.extend_from_slice(&buf);
++            if tail.len() > 4 * TAIL_HASH_BYTES as usize {
++                tail.drain(..tail.len() - TAIL_HASH_BYTES as usize);
++            }
++            buf.pop();
++            if buf.last() == Some(&b'\r') { buf.pop(); }
++        }
++        let line_seq = seq;
++        if complete { offset += n as u64; seq += 1; }
++        let row = parse_line(&buf);
++        if let Some(chk) = &mut check {
++            let db_row = chk.query_row(params![session_id, line_seq], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
++            if db_row == row {
++                if complete && row.is_some() { valid += 1; }
++                continue;
++            }
++            eprintln!("    diverges at seq {}: dropped {} row(s) (re-embed needed)", line_seq, drop_from(line_seq)?);
++            check = None;
++        }
++        let Some((ts, role, tool_name, bounded)) = row else { continue };
++        new_rows += stmt.execute(params![session_id, project, line_seq, ts, role, tool_name, bounded])?;
++        if complete { valid += 1; }
+     }
+-    drop(stmt);
++    if check.take().is_some() {
++        // File is now shorter: drop rows past its last line.
++        eprintln!("    file shrank: dropped {} row(s) from seq {}", drop_from(seq)?, seq);
++    }
++    drop((stmt, check));
+ 
+     tx.execute(
+-        "INSERT OR REPLACE INTO ingest_state(file_path,mtime,lines) VALUES(?1,?2,?3)",
+-        params![path.to_string_lossy().as_ref(), mtime, new_rows as i64],
++        "INSERT OR REPLACE INTO ingest_state(file_path,mtime,lines,byte_offset,next_seq,tail_hash) VALUES(?1,?2,?3,?4,?5,?6)",
++        params![path_str, mtime, valid, offset as i64, seq, tail_hash(&tail)],
+     )?;
+     tx.commit()?;
+     Ok(new_rows)
+@@ -1234,6 +1332,7 @@ fn ollama_up() -> bool {
+ fn cmd_build(no_embed: bool, no_refresh: bool, workers: usize, project_prefix: Option<String>) -> Result<()> {
+     let archive = home().join("claude-archive");
+     fs::create_dir_all(&archive)?;
++    register_vec_extension(); // ingest_file may DELETE FROM msg_vec (rewritten-file re-sync)
+     let conn = Connection::open(db_path())?;
+     conn.pragma_update(None, "journal_mode", "WAL")?;
+     conn.pragma_update(None, "synchronous", "NORMAL")?;

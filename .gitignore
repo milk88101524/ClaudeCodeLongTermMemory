@@ -1,0 +1,8 @@
+.DS_Store
+**/.work/
+**/sandbox/bin/
+**/sandbox/home*/
+**/sandbox/*.prev.json
+*.db
+*.db-wal
+*.db-shm
