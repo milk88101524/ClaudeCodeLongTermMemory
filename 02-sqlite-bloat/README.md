@@ -1,6 +1,6 @@
 # #2 對話才多 239 筆，DB 卻暴漲 10 倍？
 
-這個資料夾是「打造 Claude Code 的長期記憶 #2」的重現資源：讓你在**自己的電腦上親眼看到** [claude-session-archive-skill](https://github.com/jrjohn/arcana-skills/tree/main/claude-session-archive-skill)（SQLite 版）的 DB 膨脹問題，以及修正後的效果。
+這個資料夾是「[打造 Claude Code 的長期記憶 #2](https://medium.com/@milk88101524/%E6%89%93%E9%80%A0-claude-code-%E7%9A%84%E9%95%B7%E6%9C%9F%E8%A8%98%E6%86%B6-2-%E5%B0%8D%E8%A9%B1%E6%89%8D%E5%A4%9A-239-%E7%AD%86-db-%E5%8D%BB%E6%9A%B4%E6%BC%B2-10-%E5%80%8D-23ad1e4f50d7)」的重現資源：讓你在**自己的電腦上親眼看到** [claude-session-archive-skill](https://github.com/jrjohn/arcana-skills/tree/main/claude-session-archive-skill)（SQLite 版）的 DB 膨脹問題，以及修正後的效果。
 
 所有測試都在這個資料夾裡的沙盒進行，**不會碰到你真正的 `~/claude-archive`**。
 
