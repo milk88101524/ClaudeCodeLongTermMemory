@@ -1,6 +1,6 @@
 # #3 問一句「為什麼」就解鎖？hooks 的奇怪行為
 
-「打造 Claude Code 的長期記憶 #3」的配套資源：[claude-session-archive-skill](https://github.com/jrjohn/arcana-skills/tree/main/claude-session-archive-skill) 兩個 hook 的修正、測試腳本，以及適合 SQLite 版的 CLAUDE.md 規則。
+「[打造 Claude Code 的長期記憶 #3](https://medium.com/@milk88101524/%E6%89%93%E9%80%A0-claude-code-%E7%9A%84%E9%95%B7%E6%9C%9F%E8%A8%98%E6%86%B6-3-%E5%95%8F%E4%B8%80%E5%8F%A5-%E7%82%BA%E4%BB%80%E9%BA%BC-%E5%B0%B1%E8%A7%A3%E9%8E%96-hooks-%E7%9A%84%E5%A5%87%E6%80%AA%E8%A1%8C%E7%82%BA-975100586778)」的配套資源：[claude-session-archive-skill](https://github.com/jrjohn/arcana-skills/tree/main/claude-session-archive-skill) 兩個 hook 的修正、測試腳本，以及適合 SQLite 版的 CLAUDE.md 規則。
 
 ## 問題
 
