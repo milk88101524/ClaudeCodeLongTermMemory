@@ -1,0 +1,37 @@
+--- a/auto-osearch-on-prompt.sh
++++ b/auto-osearch-on-prompt.sh
+@@ -64,6 +64,10 @@
+     exit 0
+ fi
+ 
++# SQLite 版的 crs 沒有 osearch：改用 vsearch
++SEARCH_CMD=osearch
++"$CRS" --help 2>/dev/null | grep -qw osearch || SEARCH_CMD=vsearch
++
+ # NOTE (v1.28, 2026-07-20): the sentinel / osearch_marker are set AFTER osearch
+ # actually runs (see below, past the cooldown check and timeout guard). Setting
+ # them here — before the cooldown early-exit and before the search even executes —
+@@ -93,17 +97,19 @@
+ fi
+ 
+ if command -v timeout >/dev/null 2>&1; then
+-    result=$(timeout "$SEARCH_TIMEOUT" "$CRS" osearch "$prompt" 2>/dev/null); rc=$?
++    result=$(timeout "$SEARCH_TIMEOUT" "$CRS" "$SEARCH_CMD" "$prompt" 2>/dev/null); rc=$?
+ elif command -v gtimeout >/dev/null 2>&1; then
+-    result=$(gtimeout "$SEARCH_TIMEOUT" "$CRS" osearch "$prompt" 2>/dev/null); rc=$?
++    result=$(gtimeout "$SEARCH_TIMEOUT" "$CRS" "$SEARCH_CMD" "$prompt" 2>/dev/null); rc=$?
+ elif command -v perl >/dev/null 2>&1; then
+-    result=$(perl -e 'alarm shift; exec @ARGV' "$SEARCH_TIMEOUT" "$CRS" osearch "$prompt" 2>/dev/null); rc=$?
++    result=$(perl -e 'alarm shift; exec @ARGV' "$SEARCH_TIMEOUT" "$CRS" "$SEARCH_CMD" "$prompt" 2>/dev/null); rc=$?
+ else
+-    result=$("$CRS" osearch "$prompt" 2>/dev/null); rc=$?
++    result=$("$CRS" "$SEARCH_CMD" "$prompt" 2>/dev/null); rc=$?
+ fi
+ 
+ # Timed out (cap killed it) → arm breaker, skip this turn.
+ [ "$rc" -ge 124 ] && { : > "$COOLDOWN"; exit 0; }
++# 其他錯誤（例如指令不存在）也算失敗，不寫解鎖標記
++[ "$rc" -ne 0 ] && exit 0
+ rm -f "$COOLDOWN"
+ 
+ # osearch actually ran (empty result still counts as "consulted, found nothing"),

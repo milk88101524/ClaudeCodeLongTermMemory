@@ -1,0 +1,51 @@
+--- a/archive-preflight.sh
++++ b/archive-preflight.sh
+@@ -98,15 +98,7 @@
+ mem_dir_re='\.claude/projects/[^/]+/memory/[^/]+\.md'
+ 
+ deny_with_reason() {
+-    cat <<EOF
+-{
+-  "hookSpecificOutput": {
+-    "hookEventName": "PreToolUse",
+-    "permissionDecision": "deny",
+-    "permissionDecisionReason": "$1"
+-  }
+-}
+-EOF
++    jq -n --arg r "$1" '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}'
+     exit 0
+ }
+ 
+@@ -147,6 +139,10 @@
+     exit 0
+ fi
+ 
++# SQLite 版的 crs 沒有 osearch：偵測一次，讓後面的規則知道現在是哪一版
++HAS_OSEARCH=0
++"$HOME/claude-archive/crs/target/release/crs" --help 2>/dev/null | grep -qw osearch && HAS_OSEARCH=1
++
+ # 1. Archive search invocation -> unlock / refresh sentinel.
+ #    osearch is THE default front door (orient→recall→pin: unions the vsearch and
+ #    csearch legs PLUS the distilled orient layer, and is never worse than vsearch).
+@@ -156,14 +152,18 @@
+ #    until osearch has run at least once this session. This makes "osearch first"
+ #    self-enforcing instead of merely advisory — previously all three refreshed the
+ #    sentinel, which let the default be silently bypassed.
+-if [ -n "$command" ] && printf '%s' "$command" | grep -qE '(^|[^A-Za-z0-9_])osearch([^A-Za-z0-9_]|$)'; then
++if [ "$HAS_OSEARCH" = 1 ] && [ -n "$command" ] && printf '%s' "$command" | grep -qE '(^|[^A-Za-z0-9_])osearch([^A-Za-z0-9_]|$)'; then
+     : > "$osearch_marker"
+     : > "$sentinel"
+     exit 0
+ fi
+ if [ -n "$command" ] && printf '%s' "$command" | grep -qE '(^|[^A-Za-z0-9_])(vsearch|csearch)([^A-Za-z0-9_]|$)'; then
+     # Counts as preflight only while an osearch opening is still fresh (v1.29).
+-    fresh_within "$osearch_marker" "$OPEN_TTL_SEC" && : > "$sentinel"
++    if [ "$HAS_OSEARCH" = 0 ]; then
++        : > "$sentinel"
++    else
++        fresh_within "$osearch_marker" "$OPEN_TTL_SEC" && : > "$sentinel"
++    fi
+     exit 0
+ fi
+ 
